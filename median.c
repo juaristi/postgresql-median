@@ -54,7 +54,6 @@ PG_FUNCTION_INFO_V1(median_transfn);
 Datum
 median_transfn(PG_FUNCTION_ARGS)
 {
-	int32 val;
 	struct median *ms;
 	MemoryContext agg_context;
 	bytea *state = (PG_ARGISNULL(0) ? NULL : PG_GETARG_BYTEA_P(0));
@@ -67,11 +66,13 @@ median_transfn(PG_FUNCTION_ARGS)
 	if (!state)
 		initialize_state(agg_context, &state);
 
-	val = PG_GETARG_INT32(1);
-	ms = (struct median *) VARDATA(state);
+	if (!PG_ARGISNULL(1))	/* skip null values */
+	{
+		ms = (struct median *) VARDATA(state);
 
-	tuplesort_putdatum(ms->tss, val, 0);
-	ms->num_elems++;
+		tuplesort_putdatum(ms->tss, PG_GETARG_INT32(1), 0);
+		ms->num_elems++;
+	}
 
 	PG_RETURN_BYTEA_P(state);
 }
