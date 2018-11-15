@@ -1,8 +1,10 @@
 #include <postgres.h>
 #include <fmgr.h>
 #include <catalog/pg_type.h>
+#include <catalog/pg_collation.h>
 #include <utils/tuplesort.h>
 #include <utils/typcache.h>
+#include <utils/builtins.h>
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -15,8 +17,6 @@ struct median {
 
 static void initialize_state(MemoryContext agg_context, bytea **state)
 {
-	struct median *ms;
-	TypeCacheEntry *typc;
 	Size len = VARHDRSZ + sizeof(struct median);
 
 	*state = MemoryContextAllocZero(agg_context, len);
@@ -24,22 +24,36 @@ static void initialize_state(MemoryContext agg_context, bytea **state)
 		elog(ERROR, "could not initialize state");
 
 	SET_VARSIZE(*state, len);
+}
 
-	/* Initialize tuplesort state */
-	typc = lookup_type_cache(INT4OID, TYPECACHE_LT_OPR);
+static Tuplesortstate *initialize_tuplesort(FmgrInfo *finfo)
+{
+	Tuplesortstate *tss;
+	TypeCacheEntry *typc;
+	Oid collation = InvalidOid,
+		oid = get_fn_expr_argtype(finfo, 1);
+
+	if (oid == InvalidOid)
+		return NULL;
+
+	typc = lookup_type_cache(oid, TYPECACHE_LT_OPR);
 	if (!typc)
-		elog(ERROR, "could not get type cache entry for INT4OID");
+		elog(ERROR, "could not get type cache entry for type %u", oid);
 
-	ms = (struct median *) VARDATA(*state);
-	ms->tss = tuplesort_begin_datum(
-			INT4OID,	/* datum type */
+	if (typc->lt_opr == InvalidOid)
+		elog(ERROR, "could not get less-than operator for type %u", oid);
+
+	if (oid == TEXTOID)
+		collation = C_COLLATION_OID;
+
+	tss = tuplesort_begin_datum(
+			oid,		/* datum type */
 			typc->lt_opr,	/* less-than operator */
-			InvalidOid,	/* no collation */
+			collation,
 			0,
 			5000,
 			0);		/* no random access */
-	if (!ms->tss)
-		elog(ERROR, "could not initialize tuplesort state");
+	return tss;
 }
 
 PG_FUNCTION_INFO_V1(median_transfn);
@@ -54,6 +68,7 @@ PG_FUNCTION_INFO_V1(median_transfn);
 Datum
 median_transfn(PG_FUNCTION_ARGS)
 {
+	Datum val;
 	struct median *ms;
 	MemoryContext agg_context;
 	bytea *state = (PG_ARGISNULL(0) ? NULL : PG_GETARG_BYTEA_P(0));
@@ -64,13 +79,21 @@ median_transfn(PG_FUNCTION_ARGS)
 		elog(ERROR, "too few arguments");
 
 	if (!state)
+	{
 		initialize_state(agg_context, &state);
+
+		ms = (struct median *) VARDATA(state);
+		ms->tss = initialize_tuplesort(fcinfo->flinfo);
+		if (!ms->tss)
+			elog(ERROR, "could not initialize tuplesort");
+	}
 
 	if (!PG_ARGISNULL(1))	/* skip null values */
 	{
+		val = PG_GETARG_DATUM(1);
 		ms = (struct median *) VARDATA(state);
 
-		tuplesort_putdatum(ms->tss, PG_GETARG_INT32(1), 0);
+		tuplesort_putdatum(ms->tss, val, 0);
 		ms->num_elems++;
 	}
 
@@ -89,44 +112,36 @@ PG_FUNCTION_INFO_V1(median_finalfn);
 Datum
 median_finalfn(PG_FUNCTION_ARGS)
 {
-	Datum val;
+	Datum val, ab;
 	bool is_null;
 	uint32 pos;
 	struct median *ms;
 	MemoryContext agg_context;
-#ifdef PRINT_TUPLESORT_STATS
-	long space_used = 0;
-	const char *sort_method = NULL, *space_type = NULL;
-#endif
+	bytea *state = (PG_ARGISNULL(0) ? NULL : PG_GETARG_BYTEA_P(0));
 
 	if (!AggCheckCallContext(fcinfo, &agg_context))
 		elog(ERROR, "median_finalfn called in non-aggregate context");
 	if (PG_NARGS() < 2)
 		elog(ERROR, "too few arguments");
 
-	if (PG_ARGISNULL(0))
+	if (!state)
 		PG_RETURN_NULL();
 
-	ms = (struct median *) VARDATA(PG_GETARG_BYTEA_P(0));
+	ms = (struct median *) VARDATA(state);
 
 	tuplesort_performsort(ms->tss);
-
-#ifdef PRINT_TUPLESORT_STATS
-	tuplesort_get_stats(ms->tss, &sort_method, &space_type, &space_used);
-
-	elog(NOTICE, "Sort method: %s", sort_method);
-	elog(NOTICE, "Space type: %s", space_type);
-	elog(NOTICE, "Space used: %ld KB", space_used);
-#endif
 
 	pos = ms->num_elems / 2;
 
 	if (!tuplesort_skiptuples(ms->tss, pos, 1))
-		elog(ERROR, "could not advance %d slots", pos);
-	if (!tuplesort_getdatum(ms->tss, 1, &val, &is_null, NULL))
-		elog(ERROR, "could not get element after advancing %d slots", pos);
-	if (is_null)
-		elog(ERROR, "element at position %d is null - this should not happen", pos);
+		elog(ERROR, "could not advance %u slots", pos);
+	if (!tuplesort_getdatum(ms->tss, 1, &val, &is_null, &ab))
+		elog(ERROR, "could not get element after advancing %u slots", pos);
 
-	PG_RETURN_INT32(val);
+//	tuplesort_end(ms->tss);
+
+	if (is_null)
+		elog(ERROR, "element at position %u is null - this should not happen", pos);
+
+	PG_RETURN_DATUM(val);
 }
